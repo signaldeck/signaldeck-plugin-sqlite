@@ -129,7 +129,8 @@ class   SqliteStore(DataStore):
     def __init__(
         self,
         loop,
-        url: str = "sqlite:///data.db"
+        url: str = "sqlite:///data.db",
+        backup_name: str = "backup.sqlite"
     ) -> None:
         """SQLAlchemy-Store.
         :param url: SQLAlchemy-URL (SQLite oder Postgres)
@@ -137,7 +138,7 @@ class   SqliteStore(DataStore):
         :param echo: SQLAlchemy echo
         :param create: Schema bei Bedarf erzeugen
         """
-        super().__init__(loop,config={"url":url})
+        super().__init__(loop,config={"url":url, "backup_name": backup_name})
         self.url = url
         self.logger = logging.getLogger(__name__)
         self.engine: Engine = create_engine(self.url, echo=False, future=True)
@@ -586,7 +587,7 @@ class   SqliteStore(DataStore):
         return self._last_record(processor_name,config)
     
     def backup(self):
-        dest = Path("backup") / "backup.sqlite"
+        dest = Path("backup") / self.config.get("backup_name", "backup.sqlite")
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         # (optional) laufende WAL aufräumen
