@@ -484,7 +484,7 @@ class   SqliteStore(DataStore):
             val_table = values_str
         stmt = (
             select(records.c.ts, val_table.c.value)
-            .select_from(val_table.join(records, records.c.id == values_num.c.record_id))
+            .select_from(val_table.join(records, records.c.id == val_table.c.record_id))
             .where(
                 (val_table.c.field_id == field.id)
                 & (records.c.processor_id == pid)
