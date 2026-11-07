@@ -621,14 +621,27 @@ class   SqliteStore(DataStore):
 
             values_by_id = {int(record_id): {} for record_id, _ in rows}
             if rows:
+                # SQLite builds have different bound-parameter limits. Keep
+                # each IN query small even for unbounded get_records() calls.
                 ids = list(values_by_id)
                 for val_table in (values_str, values_num):
-                    stmt = select(val_table.c.record_id, val_table.c.field_id, val_table.c.value).where(
-                        val_table.c.record_id.in_(ids),
-                        val_table.c.field_id.in_([f.id for f in resolved.values() if f is not None and (f.is_str() == (val_table is values_str))]),
-                    )
-                    for record_id, field_id, value in conn.execute(stmt):
-                        values_by_id[int(record_id)][int(field_id)] = value
+                    field_ids = list({
+                        f.id for name, f in resolved.items()
+                        if name in requested and f is not None
+                        and (f.is_str() == (val_table is values_str))
+                    })
+                    if not field_ids:
+                        continue
+                    for start in range(0, len(ids), 64):
+                        id_batch = ids[start:start + 64]
+                        stmt = select(
+                            val_table.c.record_id, val_table.c.field_id, val_table.c.value
+                        ).where(
+                            val_table.c.record_id.in_(id_batch),
+                            val_table.c.field_id.in_(field_ids),
+                        )
+                        for record_id, field_id, value in conn.execute(stmt):
+                            values_by_id[int(record_id)][int(field_id)] = value
 
         payload = []
         index = []
