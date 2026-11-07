@@ -1,6 +1,7 @@
 """Filtered record queries: schema compatibility, ordering and stable pagination."""
 from datetime import datetime, timedelta, timezone
 import logging
+import sqlite3
 
 import pandas as pd
 import pytest
@@ -124,3 +125,27 @@ def test_submillisecond_date_bounds_are_not_truncated(store):
         date_to=base + timedelta(microseconds=700),
     )
     assert result.records["id"].tolist() == ["inside"]
+
+
+def test_unbounded_query_batches_payload_reads_under_sqlite_variable_limit(store):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(150):
+        add(store, base + timedelta(milliseconds=index), f"event-{index}", "chat")
+
+    # Simulate an SQLite build with a restrictive parameter count. The old
+    # query bound every record ID at once and would fail with OperationalError.
+    with store.engine.connect() as conn:
+        raw = conn.connection.driver_connection
+        previous_limit = raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 128)
+        try:
+            result = store.query_records(
+                "socketio", ["id", "payload"], {}, filters={"type": "chat"}
+            )
+            assert len(result.records) == 150
+            assert result.records["id"].tolist() == [
+                f"event-{index}" for index in range(150)
+            ]
+            assert result.records["payload"].iloc[-1] == "payload-event-149"
+            assert result.next_cursor is None
+        finally:
+            raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
