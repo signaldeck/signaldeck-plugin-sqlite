@@ -25,13 +25,15 @@ store.dispose()
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
+import json
 import asyncio, logging
 from contextlib import nullcontext
 import pandas as pd
 from datetime import date, datetime, timedelta, timezone, time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from signaldeck_sdk import Field
-from signaldeck_sdk import DataStore
+from signaldeck_sdk import DataStore, RecordsPage
 import numpy as np
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -54,7 +56,11 @@ from sqlalchemy import (
     text,
     select,
     insert,
-    update
+    update,
+    and_,
+    or_,
+    exists,
+    func,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
@@ -498,6 +504,146 @@ class   SqliteStore(DataStore):
         return pd.DataFrame(data,columns=["date",field_name]).dropna()
 
 
+
+    def query_records(
+        self,
+        processor_name: str,
+        fields,
+        config: dict,
+        *,
+        filters=None,
+        date_from=None,
+        date_to=None,
+        limit=None,
+        cursor=None,
+        order="asc",
+    ) -> RecordsPage:
+        """Select complete records with server-side equality filters and keyset paging.
+
+        Every filter must match a persisted field. The cursor includes an ID
+        high-water mark so records inserted mid-pagination cannot change pages.
+        Time bounds are [date_from, date_to); sorting is by (timestamp, row ID).
+        """
+        if order not in ("asc", "desc"):
+            raise ValueError("order must be 'asc' or 'desc'")
+        if limit is not None and (not isinstance(limit, int) or not 1 <= limit <= 10000):
+            raise ValueError("limit must be between 1 and 10000")
+        if cursor is not None and limit is None:
+            raise ValueError("cursor requires limit")
+        if not isinstance(fields, (list, tuple)) or not fields or any(not isinstance(f, str) for f in fields):
+            raise ValueError("fields must be a nonempty list of field names")
+        if filters is not None and not isinstance(filters, dict) and not hasattr(filters, "items"):
+            raise ValueError("filters must be a mapping")
+        filters = dict(filters or {})
+        pid = self.get_or_create_processor_id(processor_name)
+        requested = list(dict.fromkeys(fields))
+        all_names = set(requested) | set(filters)
+        resolved = {name: self.get_field(pid, name) for name in all_names if name != "date"}
+        missing = [name for name, field in resolved.items() if field is None]
+        if missing:
+            raise ValueError(f"Unknown persist fields: {sorted(missing)}")
+        if "date" in filters:
+            raise ValueError("Filter 'date' is not supported; use date_from/date_to")
+
+        # The cursor is deliberately tied to the query; reusing one with other
+        # filters, bounds or sort order must fail rather than silently skip rows.
+        def to_epoch(bound):
+            if bound is None:
+                return None
+            if not isinstance(bound, datetime):
+                raise ValueError("date bounds must be datetime values")
+            return int(self.getTsFromDate(self.assure_tz_aware(bound, config)))
+
+        begin = to_epoch(date_from)
+        end = to_epoch(date_to)
+        if begin is not None and end is not None and begin > end:
+            raise ValueError("date_from must not exceed date_to")
+        canonical_filters = json.dumps(filters, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+        query_key = json.dumps([processor_name, requested, canonical_filters, begin, end, order], separators=(",", ":"))
+        last_ts = last_id = watermark = None
+        if cursor is not None:
+            try:
+                raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+                state = json.loads(raw)
+                if state["v"] != 1 or state["q"] != query_key:
+                    raise ValueError("Cursor does not match the query")
+                last_ts, last_id, watermark = (int(state[k]) for k in ("ts", "id", "max_id"))
+                if min(last_id, watermark) < 0:
+                    raise ValueError("Invalid cursor")
+            except (KeyError, TypeError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError("Invalid or mismatched query cursor") from exc
+
+        conditions = [records.c.processor_id == pid]
+        if begin is not None:
+            conditions.append(records.c.ts >= begin)
+        if end is not None:
+            conditions.append(records.c.ts < end)
+
+        for name, value in filters.items():
+            field = resolved[name]
+            if value is None or isinstance(value, (list, tuple, set, dict)):
+                raise ValueError(f"Only scalar, non-null equality filters are supported: {name}")
+            numeric, converted = field.handleValueToDB(value, {}, config, self.logger)
+            if converted is None:
+                raise ValueError(f"Invalid filter value for field {name}")
+            val_table = values_num if numeric else values_str
+            conditions.append(exists(select(1).select_from(val_table).where(and_(
+                val_table.c.record_id == records.c.id,
+                val_table.c.field_id == field.id,
+                val_table.c.value == converted,
+            ))))
+
+        with self.engine.connect() as conn:
+            if watermark is None:
+                watermark = conn.execute(select(func.max(records.c.id)).where(records.c.processor_id == pid)).scalar() or 0
+            conditions.append(records.c.id <= watermark)
+            if last_ts is not None:
+                if order == "asc":
+                    conditions.append(or_(records.c.ts > last_ts, and_(records.c.ts == last_ts, records.c.id > last_id)))
+                else:
+                    conditions.append(or_(records.c.ts < last_ts, and_(records.c.ts == last_ts, records.c.id < last_id)))
+            sort = (records.c.ts.asc(), records.c.id.asc()) if order == "asc" else (records.c.ts.desc(), records.c.id.desc())
+            statement = select(records.c.id, records.c.ts).where(and_(*conditions)).order_by(*sort)
+            if limit is not None:
+                statement = statement.limit(limit + 1)
+            rows = conn.execute(statement).all()
+            has_next = limit is not None and len(rows) > limit
+            if has_next:
+                rows = rows[:limit]
+
+            values_by_id = {int(record_id): {} for record_id, _ in rows}
+            if rows:
+                ids = list(values_by_id)
+                for val_table in (values_str, values_num):
+                    stmt = select(val_table.c.record_id, val_table.c.field_id, val_table.c.value).where(
+                        val_table.c.record_id.in_(ids),
+                        val_table.c.field_id.in_([f.id for f in resolved.values() if f is not None and (f.is_str() == (val_table is values_str))]),
+                    )
+                    for record_id, field_id, value in conn.execute(stmt):
+                        values_by_id[int(record_id)][int(field_id)] = value
+
+        payload = []
+        index = []
+        for record_id, ts in rows:
+            result = {}
+            for name in requested:
+                if name == "date":
+                    continue
+                field = resolved[name]
+                raw = values_by_id[int(record_id)].get(field.id)
+                result[name] = field.handleValueFromDB(raw, config) if raw is not None else None
+            payload.append(result)
+            index.append(self.getDateFromTs(int(ts), config))
+        frame = pd.DataFrame(payload, columns=[x for x in requested if x != "date"])
+        frame.index = pd.DatetimeIndex(index, name="date")
+        if "date" in requested:
+            frame["date"] = frame.index
+        next_cursor = None
+        if has_next:
+            last_record_id, last_record_ts = rows[-1]
+            state = {"v": 1, "q": query_key, "ts": int(last_record_ts), "id": int(last_record_id), "max_id": int(watermark)}
+            next_cursor = base64.urlsafe_b64encode(json.dumps(state, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        return RecordsPage(records=frame, next_cursor=next_cursor)
 
     def select_day_wide(self, processor_name: str, day: date):
         pid = self.get_or_create_processor_id(processor_name)
