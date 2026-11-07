@@ -82,3 +82,45 @@ def test_date_bounds_and_descending_order(store):
 def test_unknown_field_fails_explicitly(store):
     with pytest.raises(ValueError, match="Unknown persist fields"):
         store.query_records("socketio", ["id"], {}, filters={"missing": "x"})
+
+
+@pytest.mark.parametrize("order", ["asc", "desc"])
+def test_cursor_preserves_submillisecond_timestamps(store, order):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # SQLite can store fractional milliseconds even in the declared BigInteger column.
+    add(store, base + timedelta(microseconds=500), "first", "appointment")
+    add(store, base + timedelta(microseconds=600), "second", "appointment")
+    add(store, base + timedelta(microseconds=700), "third", "appointment")
+    add(store, base + timedelta(milliseconds=1, microseconds=250), "fourth", "appointment")
+
+    expected = ["first", "second", "third", "fourth"]
+    if order == "desc":
+        expected.reverse()
+
+    seen = []
+    cursor = None
+    for _ in range(len(expected) + 1):
+        page = store.query_records(
+            "socketio", ["id"], {}, filters={"type": "appointment"},
+            limit=1, cursor=cursor, order=order,
+        )
+        seen.extend(page.records["id"].tolist())
+        if page.next_cursor is None:
+            break
+        assert page.next_cursor != cursor, "Cursor must advance between pages"
+        cursor = page.next_cursor
+    assert seen == expected
+    assert page.next_cursor is None
+
+
+def test_submillisecond_date_bounds_are_not_truncated(store):
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    add(store, base + timedelta(microseconds=500), "before", "appointment")
+    add(store, base + timedelta(microseconds=600), "inside", "appointment")
+    add(store, base + timedelta(microseconds=700), "after", "appointment")
+    result = store.query_records(
+        "socketio", ["id"], {},
+        date_from=base + timedelta(microseconds=600),
+        date_to=base + timedelta(microseconds=700),
+    )
+    assert result.records["id"].tolist() == ["inside"]
