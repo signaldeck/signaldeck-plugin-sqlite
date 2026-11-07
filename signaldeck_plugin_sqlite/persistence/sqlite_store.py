@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import base64
 import json
+import math
 import asyncio, logging
 from contextlib import nullcontext
 import pandas as pd
@@ -552,7 +553,7 @@ class   SqliteStore(DataStore):
                 return None
             if not isinstance(bound, datetime):
                 raise ValueError("date bounds must be datetime values")
-            return int(self.getTsFromDate(self.assure_tz_aware(bound, config)))
+            return self.getTsFromDate(self.assure_tz_aware(bound, config))
 
         begin = to_epoch(date_from)
         end = to_epoch(date_to)
@@ -567,7 +568,14 @@ class   SqliteStore(DataStore):
                 state = json.loads(raw)
                 if state["v"] != 1 or state["q"] != query_key:
                     raise ValueError("Cursor does not match the query")
-                last_ts, last_id, watermark = (int(state[k]) for k in ("ts", "id", "max_id"))
+                last_ts = state["ts"]  # Keep the database's fractional milliseconds.
+                if (
+                    isinstance(last_ts, bool)
+                    or not isinstance(last_ts, (int, float))
+                    or (isinstance(last_ts, float) and not math.isfinite(last_ts))
+                ):
+                    raise ValueError("Invalid cursor timestamp")
+                last_id, watermark = int(state["id"]), int(state["max_id"])
                 if min(last_id, watermark) < 0:
                     raise ValueError("Invalid cursor")
             except (KeyError, TypeError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
@@ -633,7 +641,7 @@ class   SqliteStore(DataStore):
                 raw = values_by_id[int(record_id)].get(field.id)
                 result[name] = field.handleValueFromDB(raw, config) if raw is not None else None
             payload.append(result)
-            index.append(self.getDateFromTs(int(ts), config))
+            index.append(self.getDateFromTs(ts, config))
         frame = pd.DataFrame(payload, columns=[x for x in requested if x != "date"])
         frame.index = pd.DatetimeIndex(index, name="date")
         if "date" in requested:
@@ -641,7 +649,7 @@ class   SqliteStore(DataStore):
         next_cursor = None
         if has_next:
             last_record_id, last_record_ts = rows[-1]
-            state = {"v": 1, "q": query_key, "ts": int(last_record_ts), "id": int(last_record_id), "max_id": int(watermark)}
+            state = {"v": 1, "q": query_key, "ts": last_record_ts, "id": int(last_record_id), "max_id": int(watermark)}
             next_cursor = base64.urlsafe_b64encode(json.dumps(state, separators=(",", ":")).encode("utf-8")).decode("ascii")
         return RecordsPage(records=frame, next_cursor=next_cursor)
 
