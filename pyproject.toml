@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signaldeck-plugin-sqlite"
-version = "0.6.1"
+version = "0.6.2"
 description = "SQLite plugin for SignalDeck providing sqlite-datastore"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-   "signaldeck-sdk>=0.6.2",
+   "signaldeck-sdk>=0.6.3",
   "SQLAlchemy>=2.0.44"
 ]
 
